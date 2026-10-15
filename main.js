@@ -5,8 +5,10 @@
 // @description  Rellena formularios de empleo con Ollama local
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @connect      localhost
-// @require      file://C:\Users\phili\Desktop\codigoboludo\JobAutocomplete\datos_mios.js
+// @connect      127.0.0.1
+// @require      file:///C:/Users/phili/Desktop/codigoboludo/JobAutocomplete/datos_mios.js?v=1
 // ==/UserScript==
 
 (function() {
@@ -30,86 +32,131 @@
         btn.disabled = true;
 
         try {
-            const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]), textarea'));
+            const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="password"]), textarea'));
             
             const fieldSummary = inputs.map((input, index) => {
-                const label = document.querySelector(`label[for="${input.id}"]`)?.innerText 
-                              || input.getAttribute('aria-label') 
-                              || input.placeholder 
-                              || input.name 
-                              || input.id;
+                const labelElem = document.querySelector(`label[for="${input.id}"]`);
+                const parentLabel = input.closest('label');
+                const labelText = labelElem?.innerText || parentLabel?.innerText || '';
+                
+                const descriptor = labelText.replace(/\s+/g, ' ').trim()
+                                  || input.getAttribute('aria-label') 
+                                  || input.placeholder 
+                                  || input.name 
+                                  || input.id 
+                                  || '';
+
                 return {
-                    temp_id: index,
-                    type: input.type || 'text',
-                    descriptor: (label || 'campo sin etiqueta').trim()
+                    id: String(index),
+                    label: descriptor.replace(/[*:]/g, '').trim()
                 };
-            }).filter(f => f.descriptor.length > 0);
+            }).filter(f => f.label.length > 0);
 
-            const prompt = `
-Eres un asistente que rellena formularios de empleo con precisión.
+            console.log("Campos enviados a Ollama:", fieldSummary);
 
-DATOS DEL CANDIDATO:
-${JSON.stringify(profile, null, 2)}
+            const prompt = `Task: Data matching for form autofill.
 
-CAMPOS DETECTADOS EN EL FORMULARIO (índice y descripción):
-${JSON.stringify(fieldSummary, null, 2)}
+CANDIDATE PROFILE:
+${JSON.stringify(profile)}
 
-INSTRUCCIONES CLAVE:
-1. Para datos personales o de contacto, usa la sección "personal".
-2. Si el formulario pide un puesto, empresa, título o fecha de empleo/estudio sin especificar cuál, usa SIEMPRE el más reciente (el primer elemento de "experience" o "education").
-3. Si el campo pide un resumen o carta, usa "summary".
-4. Si el campo pregunta por visados, idiomas, salario o preaviso, busca en "screeningQuestions".
-5. Si un campo no aplica, es opcional o no encuentras correspondencia clara en los datos, NO lo incluyas en el JSON.
-6. Devuelve EXCLUSIVAMENTE un mapa JSON donde cada clave sea el 'temp_id' (en string) y el valor sea el texto exacto a escribir.
+FIELDS TO FILL:
+${JSON.stringify(fieldSummary)}
 
-Ejemplo de respuesta esperada:
-{
-  "0": "Carlos",
-  "1": "García",
-  "4": "carlos.garcia@email.com",
-  "8": "Ingeniero de Software / IA"
-}
-`;
+STRICT RULES:
+1. You MUST include EVERY single "id" from the Fields list in your JSON output. Do not skip any.
+2. If you know the answer from the profile, write the exact value.
+3. For Yes/No questions or checkboxes (like "Yes", "I accept"), if it matches the profile, write "true".
+4. If you DO NOT have the data for a field, you MUST write "" (empty string).
+5. NEVER write the id number as the value.
 
+EXAMPLE FORMAT:
+{"0": "Carlos", "1": "García", "2": "carlos@email.com", "3": "+34600000000", "4": "", "19": "true"}
+
+OUTPUT ONLY VALID JSON.`;
+
+            // 2. EN LA LLAMADA A OLLAMA, AÑADIMOS NUM_PREDICT
             GM_xmlhttpRequest({
                 method: "POST",
-                url: "http://localhost:11434/api/generate",
+                url: "http://127.0.0.1:11434/api/generate",
                 headers: { "Content-Type": "application/json" },
                 data: JSON.stringify({
                     model: "llama3.2:1b",
                     prompt: prompt,
                     stream: false,
-                    format: "json"
+                    format: "json",
+                    options: { 
+                        temperature: 0.0, // Cero absoluto de creatividad
+                        num_predict: 1500 // Evita que corte el JSON por la mitad
+                    }
                 }),
                 onload: (response) => {
-                    const resData = JSON.parse(response.responseText);
-                    const filledData = JSON.parse(resData.response);
+                    let rellenados = 0;
+                    try {
+                        const resData = JSON.parse(response.responseText);
+                        const filledData = typeof resData.response === 'string' ? JSON.parse(resData.response) : resData.response;
+                        
+                        console.log("Respuesta devuelta por Ollama:", filledData);
 
-                    for (const [idStr, value] of Object.entries(filledData)) {
-                        const targetInput = inputs[parseInt(idStr, 10)];
-                        if (targetInput && value) {
-                            setNativeValue(targetInput, value);
+                        for (const [key, value] of Object.entries(filledData)) {
+                            if (!value || String(value).trim() === "") continue;
+
+                            let targetInput = null;
+
+                            // Caso 1: Devolvió el id numérico esperado
+                            if (!isNaN(parseInt(key, 10)) && inputs[parseInt(key, 10)]) {
+                                targetInput = inputs[parseInt(key, 10)];
+                            } 
+                            // Caso 2: El modelo devolvió el nombre de la etiqueta en vez del id
+                            else {
+                                const matchingField = fieldSummary.find(f => f.label.toLowerCase() === key.toLowerCase());
+                                if (matchingField) {
+                                    targetInput = inputs[parseInt(matchingField.id, 10)];
+                                }
+                            }
+
+                            if (targetInput) {
+                                setNativeValue(targetInput, String(value));
+                                rellenados++;
+                            }
                         }
-                    }
 
-                    btn.innerText = '¡Listo!';
-                    setTimeout(() => { btn.innerText = 'Rellenar Automaticamente'; btn.disabled = false; }, 2500);
+                        console.log(`Total campos inyectados: ${rellenados}`);
+                        btn.innerText = `¡Listo (${rellenados})!`;
+
+                    } catch (err) {
+                        console.error("Error procesando:", err);
+                        btn.innerText = 'Error JSON';
+                    } finally {
+                        setTimeout(() => {
+                            btn.innerText = '🤖 Rellenar con IA';
+                            btn.disabled = false;
+                        }, 3000);
+                    }
                 },
-                onerror: () => {
-                    alert("Error conectando con Ollama en localhost:11434");
-                    btn.innerText = 'Error';
+                onerror: (err) => {
+                    console.error("Error red:", err);
+                    btn.innerText = 'Error red';
                     btn.disabled = false;
                 }
             });
 
         } catch (err) {
-            console.error(err);
+            console.error("Error:", err);
             btn.innerText = 'Error';
             btn.disabled = false;
         }
     };
 
     function setNativeValue(element, value) {
+        // Manejar checkboxes y radio buttons
+        if (element.type === 'checkbox' || element.type === 'radio') {
+            element.checked = (value === 'true' || value === true);
+            element.dispatchEvent(new Event('click', { bubbles: true }));
+            element.dispatchEvent(new Event('change', { bubbles: true }));
+            return;
+        }
+        
+        // Manejar inputs de texto normales
         const lastValue = element.value;
         element.value = value;
         const tracker = element._valueTracker;
